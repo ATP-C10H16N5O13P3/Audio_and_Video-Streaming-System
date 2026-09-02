@@ -1,0 +1,19 @@
+This is made for wayland linux specifically (for the video).
+(Tested with gnome on debian 13)
+
+In the archive we have code that was originally for x11.
+
+This code still have hard coded config,
+some things might not work on some systems
+
+python packages:
+pip install opencv-python-headless sounddevice numpy
+
+pip install opencv-python-headless
+pip install sounddevice
+pip install numpy
+
+other requirements (some might not be said):
+ffmjpeg
+pactl
+pavucontrol (for control not running the code)
