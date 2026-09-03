@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 V4L2 Raw MJPEG Recorder & Delayed Playback Monitor
-- Wayland Native frameless window.
-- Saves raw MJPEG and V4L2 timestamps into a dedicated folder.
+- Wayland native frameless window.
+- Fully configurable via config/video.config using configparser.
+- Saves raw MJPEG and V4L2 timestamps into dedicated directories.
 """
 
 import collections
+import configparser
 import ctypes
 import datetime
 import fcntl
@@ -16,16 +18,69 @@ import select
 import struct
 import sys
 import time
+
 import cv2
 import numpy as np
 
-os.environ["QT_LOGGING_RULES"] = "qt.qpa.wayland*=false;*.debug=false"
+# ==============================================================================
+# Configuration Loader
+# ==============================================================================
+CONFIG_PATH = os.path.join("config", "video.config")
+
+DEFAULT_CONFIG = {
+    "camera": {
+        "bus": "0",
+        "device": "0",
+        "width": "1920",
+        "height": "1080",
+        "num_buffers": "4",
+        "timeout": "2.0",
+        "reconnect_poll_interval": "0.7",
+    },
+    "recording": {
+        "output_base_dir": "recordings",
+        "dir_prefix": "capture_",
+        "video_filename": "video.mjpeg",
+        "timestamps_filename": "timestamps.txt",
+    },
+    "display": {
+        "initial_delay_sec": "2.0",
+        "min_delay_sec": "0.0",
+        "max_delay_sec": "10.0",
+        "delay_step_sec": "0.5",
+        "max_buffer_frames": "1000",
+        "start_borderless": "true",
+        "start_fullscreen": "false",
+        "qt_logging_rules": "qt.qpa.wayland*=false;*.debug=false",
+    },
+}
+
+
+def load_or_create_config(path=CONFIG_PATH):
+  config = configparser.ConfigParser()
+  if not os.path.exists(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    config.read_dict(DEFAULT_CONFIG)
+    with open(path, "w") as f:
+      config.write(f)
+    print(f"[*] Generated default configuration file at: {path}")
+  else:
+    config.read(path)
+  return config
+
+
+CFG = load_or_create_config()
+os.environ["QT_LOGGING_RULES"] = CFG.get(
+    "display",
+    "qt_logging_rules",
+    fallback="qt.qpa.wayland*=false;*.debug=false",
+)
 
 try:
-    from PyQt5 import QtCore, QtGui, QtWidgets
+  from PyQt5 import QtCore, QtGui, QtWidgets
 except ImportError:
-    print("[!] Error: PyQt5 is required. Run: pip install PyQt5")
-    sys.exit(1)
+  print("[!] Error: PyQt5 is required. Run: pip install PyQt5")
+  sys.exit(1)
 
 # ==============================================================================
 # Linux V4L2 Kernel Definitions
@@ -42,99 +97,148 @@ V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 V4L2_MEMORY_MMAP = 1
 V4L2_FIELD_ANY = 0
 
-def v4l2_fourcc(a, b, c, d):
-  return (ord(a) | (ord(b) << 8) | (ord(c) << 16) | (ord(d) << 24))
 
-V4L2_PIX_FMT_MJPEG = v4l2_fourcc('M', 'J', 'P', 'G')
+def v4l2_fourcc(a, b, c, d):
+  return ord(a) | (ord(b) << 8) | (ord(c) << 16) | (ord(d) << 24)
+
+
+V4L2_PIX_FMT_MJPEG = v4l2_fourcc("M", "J", "P", "G")
+
 
 class v4l2_pix_format(ctypes.Structure):
   _fields_ = [
-      ('width', ctypes.c_uint32), ('height', ctypes.c_uint32),
-      ('pixelformat', ctypes.c_uint32), ('field', ctypes.c_uint32),
-      ('bytesperline', ctypes.c_uint32), ('sizeimage', ctypes.c_uint32),
-      ('colorspace', ctypes.c_uint32), ('priv', ctypes.c_uint32),
-      ('flags', ctypes.c_uint32), ('ycbcr_enc', ctypes.c_uint32),
-      ('quantization', ctypes.c_uint32), ('xfer_func', ctypes.c_uint32),
+      ("width", ctypes.c_uint32),
+      ("height", ctypes.c_uint32),
+      ("pixelformat", ctypes.c_uint32),
+      ("field", ctypes.c_uint32),
+      ("bytesperline", ctypes.c_uint32),
+      ("sizeimage", ctypes.c_uint32),
+      ("colorspace", ctypes.c_uint32),
+      ("priv", ctypes.c_uint32),
+      ("flags", ctypes.c_uint32),
+      ("ycbcr_enc", ctypes.c_uint32),
+      ("quantization", ctypes.c_uint32),
+      ("xfer_func", ctypes.c_uint32),
   ]
 
+
 class v4l2_format(ctypes.Structure):
+
   class _u(ctypes.Union):
-    _fields_ = [('pix', v4l2_pix_format), ('raw_data', ctypes.c_uint8 * 200)]
-  _anonymous_ = ('u',)
-  _fields_ = [('type', ctypes.c_uint32), ('u', _u)]
+    _fields_ = [("pix", v4l2_pix_format), ("raw_data", ctypes.c_uint8 * 200)]
+
+  _anonymous_ = ("u",)
+  _fields_ = [("type", ctypes.c_uint32), ("u", _u)]
+
 
 class v4l2_requestbuffers(ctypes.Structure):
   _fields_ = [
-      ('count', ctypes.c_uint32), ('type', ctypes.c_uint32),
-      ('memory', ctypes.c_uint32), ('reserved', ctypes.c_uint32 * 2),
+      ("count", ctypes.c_uint32),
+      ("type", ctypes.c_uint32),
+      ("memory", ctypes.c_uint32),
+      ("reserved", ctypes.c_uint32 * 2),
   ]
+
 
 class v4l2_timeval(ctypes.Structure):
-  _fields_ = [('tv_sec', ctypes.c_long), ('tv_usec', ctypes.c_long)]
+  _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
+
 
 class v4l2_buffer(ctypes.Structure):
+
   class _u(ctypes.Union):
-    _fields_ = [('offset', ctypes.c_uint32), ('userptr', ctypes.c_ulong)]
-  _anonymous_ = ('m',)
+    _fields_ = [("offset", ctypes.c_uint32), ("userptr", ctypes.c_ulong)]
+
+  _anonymous_ = ("m",)
   _fields_ = [
-      ('index', ctypes.c_uint32), ('type', ctypes.c_uint32),
-      ('bytesused', ctypes.c_uint32), ('flags', ctypes.c_uint32),
-      ('field', ctypes.c_uint32), ('timestamp', v4l2_timeval),
-      ('timecode', ctypes.c_uint32 * 4), ('sequence', ctypes.c_uint32),
-      ('memory', ctypes.c_uint32), ('m', _u),
-      ('length', ctypes.c_uint32), ('reserved2', ctypes.c_uint32),
-      ('reserved', ctypes.c_uint32),
+      ("index", ctypes.c_uint32),
+      ("type", ctypes.c_uint32),
+      ("bytesused", ctypes.c_uint32),
+      ("flags", ctypes.c_uint32),
+      ("field", ctypes.c_uint32),
+      ("timestamp", v4l2_timeval),
+      ("timecode", ctypes.c_uint32 * 4),
+      ("sequence", ctypes.c_uint32),
+      ("memory", ctypes.c_uint32),
+      ("m", _u),
+      ("length", ctypes.c_uint32),
+      ("reserved2", ctypes.c_uint32),
+      ("reserved", ctypes.c_uint32),
   ]
+
 
 # ==============================================================================
 # USB Helper Functions
 # ==============================================================================
 def get_usb_info(video_name_file):
   video_dir = os.path.dirname(video_name_file)
-  device_link = os.path.join(video_dir, 'device')
-  if not os.path.exists(device_link): return None
+  device_link = os.path.join(video_dir, "device")
+  if not os.path.exists(device_link):
+    return None
   usb_device_dir = os.path.dirname(os.path.realpath(device_link))
   try:
-      with open(os.path.join(usb_device_dir, 'busnum')) as f: bus = int(f.read().strip())
-      with open(os.path.join(usb_device_dir, 'devnum')) as f: dev = int(f.read().strip())
-      with open(os.path.join(usb_device_dir, 'devpath')) as f: devpath = f.read().strip()
-      return {'bus': bus, 'dev': dev, 'devpath': devpath}
-  except Exception: return None
+    with open(os.path.join(usb_device_dir, "busnum")) as f:
+      bus = int(f.read().strip())
+    with open(os.path.join(usb_device_dir, "devnum")) as f:
+      dev = int(f.read().strip())
+    with open(os.path.join(usb_device_dir, "devpath")) as f:
+      devpath = f.read().strip()
+    return {"bus": bus, "dev": dev, "devpath": devpath}
+  except Exception:
+    return None
+
 
 def find_device_node_by_usb(target_bus, target_dev=None, target_devpath=None):
-  for name_file in sorted(glob.glob('/sys/class/video4linux/video*/name')):
+  for name_file in sorted(glob.glob("/sys/class/video4linux/video*/name")):
     usb_info = get_usb_info(name_file)
-    if not usb_info: continue
+    if not usb_info:
+      continue
     match = False
     if target_devpath is not None:
-        if usb_info['bus'] == target_bus and usb_info['devpath'] == target_devpath: match = True
+      if (
+          usb_info["bus"] == target_bus
+          and usb_info["devpath"] == target_devpath
+      ):
+        match = True
     elif target_dev is not None:
-        if usb_info['bus'] == target_bus and usb_info['dev'] == target_dev: match = True
+      if usb_info["bus"] == target_bus and usb_info["dev"] == target_dev:
+        match = True
     if match:
-        dev_node = f"/dev/{os.path.basename(os.path.dirname(name_file))}"
-        with open(name_file, 'r') as f: name = f.read().strip()
-        return dev_node, name, usb_info
+      dev_node = f"/dev/{os.path.basename(os.path.dirname(name_file))}"
+      with open(name_file, "r") as f:
+        name = f.read().strip()
+      return dev_node, name, usb_info
   return None, None, None
 
+
 def list_available_cameras():
-  print('\nAvailable V4L2 USB Cameras:')
+  print("\nAvailable V4L2 USB Cameras:")
   found = False
-  for name_file in sorted(glob.glob('/sys/class/video4linux/video*/name')):
+  for name_file in sorted(glob.glob("/sys/class/video4linux/video*/name")):
     try:
       usb_info = get_usb_info(name_file)
-      if not usb_info: continue
-      with open(name_file, 'r') as f: name = f.read().strip()
+      if not usb_info:
+        continue
+      with open(name_file, "r") as f:
+        name = f.read().strip()
       dev = f"/dev/{os.path.basename(os.path.dirname(name_file))}"
-      print(f"  • Bus {usb_info['bus']:03d}, Device {usb_info['dev']:03d} [Port {usb_info['devpath']}] -> {dev} ('{name}')")
+      print(
+          f"  • Bus {usb_info['bus']:03d}, Device {usb_info['dev']:03d} [Port"
+          f" {usb_info['devpath']}] -> {dev} ('{name}')"
+      )
       found = True
-    except Exception: pass
-  if not found: print("  (No USB cameras found)")
+    except Exception:
+      pass
+  if not found:
+    print("  (No USB cameras found)")
   print()
+
 
 # ==============================================================================
 # V4L2 Direct MJPEG Capture Engine
 # ==============================================================================
 class V4L2MJPEGCapture:
+
   def __init__(self, dev_node, width=1920, height=1080, num_buffers=4):
     self.dev_node = dev_node
     self.width = width
@@ -142,6 +246,15 @@ class V4L2MJPEGCapture:
     self.num_buffers = num_buffers
     self.fd = None
     self.buffers = []
+    self.actual_w = width
+    self.actual_h = height
+
+  def __enter__(self):
+    self.start()
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    self.stop()
 
   def start(self):
     self.fd = os.open(self.dev_node, os.O_RDWR | os.O_NONBLOCK, 0)
@@ -152,7 +265,7 @@ class V4L2MJPEGCapture:
     fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG
     fmt.pix.field = V4L2_FIELD_ANY
     fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
-    
+
     self.actual_w, self.actual_h = fmt.pix.width, fmt.pix.height
 
     req = v4l2_requestbuffers()
@@ -167,255 +280,337 @@ class V4L2MJPEGCapture:
       buf.memory = V4L2_MEMORY_MMAP
       buf.index = i
       fcntl.ioctl(self.fd, VIDIOC_QUERYBUF, buf)
-      mm = mmap.mmap(self.fd, buf.length, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=buf.offset)
+      mm = mmap.mmap(
+          self.fd,
+          buf.length,
+          mmap.MAP_SHARED,
+          mmap.PROT_READ | mmap.PROT_WRITE,
+          offset=buf.offset,
+      )
       self.buffers.append((mm, buf.length))
       fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
 
-    buf_type = struct.pack('I', V4L2_BUF_TYPE_VIDEO_CAPTURE)
+    buf_type = struct.pack("I", V4L2_BUF_TYPE_VIDEO_CAPTURE)
     fcntl.ioctl(self.fd, VIDIOC_STREAMON, buf_type)
 
   def read_frame(self, timeout=2.0):
     r, _, _ = select.select([self.fd], [], [], timeout)
-    if not r: raise TimeoutError('Camera frame timeout.')
+    if not r:
+      raise TimeoutError("Camera frame timeout.")
     buf = v4l2_buffer()
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
     buf.memory = V4L2_MEMORY_MMAP
     fcntl.ioctl(self.fd, VIDIOC_DQBUF, buf)
-    
-    # Extract raw bytes AND accurate V4L2 hardware timestamp
+
     raw_bytes = self.buffers[buf.index][0][: buf.bytesused]
-    v4l2_timestamp = buf.timestamp.tv_sec + (buf.timestamp.tv_usec / 1_000_000.0)
-    
+    v4l2_timestamp = buf.timestamp.tv_sec + (
+        buf.timestamp.tv_usec / 1_000_000.0
+    )
+
     fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
     return raw_bytes, v4l2_timestamp
 
   def stop(self):
     if self.fd is not None:
-      try: fcntl.ioctl(self.fd, VIDIOC_STREAMOFF, struct.pack('I', V4L2_BUF_TYPE_VIDEO_CAPTURE))
-      except Exception: pass
+      try:
+        fcntl.ioctl(
+            self.fd,
+            VIDIOC_STREAMOFF,
+            struct.pack("I", V4L2_BUF_TYPE_VIDEO_CAPTURE),
+        )
+      except Exception:
+        pass
       for mm, _ in self.buffers:
-        try: mm.close()
-        except Exception: pass
+        try:
+          mm.close()
+        except Exception:
+          pass
       self.buffers.clear()
-      try: os.close(self.fd)
-      except Exception: pass
+      try:
+        os.close(self.fd)
+      except Exception:
+        pass
       self.fd = None
 
+
 # ==============================================================================
-# Wayland Native Borderless UI (PyQt5)
+# UI Window
 # ==============================================================================
 class VideoWindow(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
-        self.has_borders = False
+
+  def __init__(self, config):
+    super().__init__()
+    self.config = config
+    self.has_borders = not config.getboolean(
+        "display", "start_borderless", fallback=True
+    )
+    self.is_fullscreen = config.getboolean(
+        "display", "start_fullscreen", fallback=False
+    )
+    self.delay_sec = config.getfloat(
+        "display", "initial_delay_sec", fallback=2.0
+    )
+    self.min_delay = config.getfloat("display", "min_delay_sec", fallback=0.0)
+    self.max_delay = config.getfloat("display", "max_delay_sec", fallback=10.0)
+    self.step_delay = config.getfloat(
+        "display", "delay_step_sec", fallback=0.5
+    )
+
+    self.apply_window_flags()
+    self.setStyleSheet("background-color: black;")
+
+    self.layout = QtWidgets.QVBoxLayout(self)
+    self.layout.setContentsMargins(0, 0, 0, 0)
+    self.layout.setSpacing(0)
+
+    self.label = QtWidgets.QLabel(self)
+    self.label.setAlignment(QtCore.Qt.AlignCenter)
+    self.layout.addWidget(self.label)
+
+    self.exit_req = False
+    self.current_w = 0
+    self.current_h = 0
+
+  def apply_window_flags(self):
+    flags = QtCore.Qt.Window
+    if not self.has_borders:
+      flags |= QtCore.Qt.FramelessWindowHint
+    self.setWindowFlags(flags)
+
+  def set_video_size(self, w, h):
+    if self.current_w != w or self.current_h != h:
+      self.current_w = w
+      self.current_h = h
+      if not self.is_fullscreen:
+        self.setFixedSize(w, h)
+
+  def keyPressEvent(self, event):
+    if event.key() in (QtCore.Qt.Key_Q, QtCore.Qt.Key_Escape):
+      self.exit_req = True
+    elif event.key() in (QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal):
+      self.delay_sec = min(self.max_delay, self.delay_sec + self.step_delay)
+    elif event.key() in (QtCore.Qt.Key_Minus, QtCore.Qt.Key_Underscore):
+      self.delay_sec = max(self.min_delay, self.delay_sec - self.step_delay)
+    elif event.key() == QtCore.Qt.Key_B:
+      if not self.is_fullscreen:
+        self.has_borders = not self.has_borders
         self.apply_window_flags()
-        self.setStyleSheet("background-color: black;")
-        
-        self.layout = QtWidgets.QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)
-        
-        self.label = QtWidgets.QLabel(self)
-        self.label.setAlignment(QtCore.Qt.AlignCenter)
-        self.layout.addWidget(self.label)
-        
-        self.delay_sec = 2.0
-        self.exit_req = False
-        self.is_fullscreen = False
-        self.current_w = 0
-        self.current_h = 0
+        self.show()
+    elif event.key() == QtCore.Qt.Key_F:
+      self.is_fullscreen = not self.is_fullscreen
+      if self.is_fullscreen:
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.showFullScreen()
+      else:
+        self.showNormal()
+        self.setFixedSize(self.current_w, self.current_h)
 
-    def apply_window_flags(self):
-        flags = QtCore.Qt.Window
-        if not self.has_borders:
-            flags |= QtCore.Qt.FramelessWindowHint
-        self.setWindowFlags(flags)
+  def update_frame(self, frame_bgr):
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    h, w, ch = frame_rgb.shape
+    bytes_per_line = ch * w
+    qimg = QtGui.QImage(
+        frame_rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888
+    )
 
-    def set_video_size(self, w, h):
-        if self.current_w != w or self.current_h != h:
-            self.current_w = w
-            self.current_h = h
-            if not self.is_fullscreen:
-                self.setFixedSize(w, h)
+    pixmap = QtGui.QPixmap.fromImage(qimg).scaled(
+        self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+    )
+    self.label.setPixmap(pixmap)
 
-    def keyPressEvent(self, event):
-        if event.key() in (QtCore.Qt.Key_Q, QtCore.Qt.Key_Escape):
-            self.exit_req = True
-        elif event.key() in (QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal):
-            self.delay_sec = min(10.0, self.delay_sec + 0.5)
-        elif event.key() in (QtCore.Qt.Key_Minus, QtCore.Qt.Key_Underscore):
-            self.delay_sec = max(0.0, self.delay_sec - 0.5)
-        elif event.key() == QtCore.Qt.Key_B:
-            if not self.is_fullscreen:
-                self.has_borders = not self.has_borders
-                self.apply_window_flags()
-                self.show()  
-        elif event.key() == QtCore.Qt.Key_F:
-            self.is_fullscreen = not self.is_fullscreen
-            if self.is_fullscreen:
-                self.setMinimumSize(0, 0)
-                self.setMaximumSize(16777215, 16777215)
-                self.showFullScreen()
-            else:
-                self.showNormal()
-                self.setFixedSize(self.current_w, self.current_h)
-
-    def update_frame(self, frame_bgr):
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_rgb.shape
-        bytes_per_line = ch * w
-        qimg = QtGui.QImage(frame_rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
-        
-        pixmap = QtGui.QPixmap.fromImage(qimg).scaled(
-            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-        )
-        self.label.setPixmap(pixmap)
 
 # ==============================================================================
 # Main Stream Loop
 # ==============================================================================
-def run_stream(target_bus, target_dev, requested_width=1920, requested_height=1080):
+def run_stream(target_bus, target_dev, config):
+  requested_w = config.getint("camera", "width", fallback=1920)
+  requested_h = config.getint("camera", "height", fallback=1080)
+  num_buffers = config.getint("camera", "num_buffers", fallback=4)
+  cam_timeout = config.getfloat("camera", "timeout", fallback=2.0)
+  poll_interval = config.getfloat(
+      "camera", "reconnect_poll_interval", fallback=0.7
+  )
+  max_buffer_frames = config.getint(
+      "display", "max_buffer_frames", fallback=1000
+  )
+
   app = QtWidgets.QApplication(sys.argv)
-  win = VideoWindow()
+  win = VideoWindow(config)
   win.show()
 
-  # Create a dedicated directory for this capture session
-  timestamp_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-  save_dir = f"capture_{timestamp_str}"
+  base_dir = config.get("recording", "output_base_dir", fallback="recordings")
+  dir_prefix = config.get("recording", "dir_prefix", fallback="capture_")
+  timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+  save_dir = os.path.join(base_dir, f"{dir_prefix}{timestamp_str}")
   os.makedirs(save_dir, exist_ok=True)
-  
-  out_filename = os.path.join(save_dir, 'video.mjpeg')
-  ts_filename = os.path.join(save_dir, 'timestamps.txt')
-  
-  out_file = open(out_filename, 'wb')
-  ts_file = open(ts_filename, 'w')
-  print(f"\n[*] Recording to folder: '{save_dir}/'")
 
-  frame_buffer = collections.deque(maxlen=1000)
+  out_filename = os.path.join(
+      save_dir,
+      config.get("recording", "video_filename", fallback="video.mjpeg"),
+  )
+  ts_filename = os.path.join(
+      save_dir,
+      config.get("recording", "timestamps_filename", fallback="timestamps.txt"),
+  )
+
+  frame_buffer = collections.deque(maxlen=max_buffer_frames)
   cap = None
   node_path = None
   locked_devpath = None
 
-  try:
-    while not win.exit_req:
-      # --- Stage 1: Device Discovery & Reconnect ---
-      if cap is None:
-        if locked_devpath:
-            node_path, found_name, usb_info = find_device_node_by_usb(target_bus, target_devpath=locked_devpath)
-            sys.stdout.write(f"\r[!] Waiting for camera on Bus {target_bus} Port {locked_devpath}... ")
-        else:
-            node_path, found_name, usb_info = find_device_node_by_usb(target_bus, target_dev=target_dev)
-            sys.stdout.write(f"\r[!] Searching for camera Bus {target_bus} Device {target_dev}... ")
+  print(f"\n[*] Recording output directory: '{save_dir}/'")
 
-        sys.stdout.flush()
-        
-        if not node_path:
-          end_time = time.time() + 0.7
-          while time.time() < end_time:
+  with open(out_filename, "wb") as out_file, open(
+      ts_filename, "w", encoding="utf-8"
+  ) as ts_file:
+    try:
+      while not win.exit_req:
+        # --- Stage 1: Device Discovery & Reconnection ---
+        if cap is None:
+          if locked_devpath:
+            node_path, found_name, usb_info = find_device_node_by_usb(
+                target_bus, target_devpath=locked_devpath
+            )
+            sys.stdout.write(
+                f"\r[!] Polling camera on Bus {target_bus} Port"
+                f" {locked_devpath}... "
+            )
+          else:
+            node_path, found_name, usb_info = find_device_node_by_usb(
+                target_bus, target_dev=target_dev
+            )
+            sys.stdout.write(
+                f"\r[!] Searching for camera Bus {target_bus} Device"
+                f" {target_dev}... "
+            )
+
+          sys.stdout.flush()
+
+          if not node_path:
+            end_time = time.time() + poll_interval
+            while time.time() < end_time:
               app.processEvents()
               time.sleep(0.05)
-          continue
-        
-        if not locked_devpath:
-            locked_devpath = usb_info['devpath']
+            continue
+
+          if not locked_devpath:
+            locked_devpath = usb_info["devpath"]
             print(f"\n[+] Locked onto physical USB Port: {locked_devpath}")
 
-        print(f"\n[+] Found '{found_name}' on {node_path}. Initializing...")
+          print(f"\n[+] Found '{found_name}' on {node_path}. Initializing...")
+          try:
+            cap = V4L2MJPEGCapture(
+                node_path,
+                width=requested_w,
+                height=requested_h,
+                num_buffers=num_buffers,
+            )
+            cap.start()
+            win.set_video_size(cap.actual_w, cap.actual_h)
+            print(f"[+] Stream active at {cap.actual_w}x{cap.actual_h}\n")
+          except Exception as e:
+            print(f"\n[X] Initialization error: {e}")
+            if cap:
+              cap.stop()
+              cap = None
+            app.processEvents()
+            input("\n[TERMINAL] Press [ENTER] to retry device connection...")
+            continue
+
+        # --- Stage 2: Ingestion, Storage & Delayed Rendering ---
         try:
-          cap = V4L2MJPEGCapture(node_path, width=requested_width, height=requested_height)
-          cap.start()
-          
-          # Force 1920x1080 as requested
-          win.set_video_size(1920, 1080)
-          print(f'[+] Stream started at {cap.actual_w}x{cap.actual_h}\n')
-        except Exception as e:
-          print(f'\n[X] Initialization error: {e}')
-          if cap:
-            cap.stop()
-            cap = None
+          raw_mjpeg, v4l2_ts = cap.read_frame(timeout=cam_timeout)
+          capture_time = time.time()
+
+          out_file.write(raw_mjpeg)
+          ts_file.write(f"{v4l2_ts:.6f}\n")
+
+          np_arr = np.frombuffer(raw_mjpeg, dtype=np.uint8)
+          frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+          if frame_bgr is not None:
+            frame_buffer.append((capture_time, frame_bgr))
+
+          now = time.time()
+          target_time = now - win.delay_sec
+
+          while len(frame_buffer) > 1 and frame_buffer[1][0] <= target_time:
+            frame_buffer.popleft()
+
+          if frame_buffer:
+            display_frame = frame_buffer[0][1]
+            actual_delay = now - frame_buffer[0][0]
+          else:
+            display_frame = np.zeros(
+                (cap.actual_h, cap.actual_w, 3), dtype=np.uint8
+            )
+            actual_delay = 0.0
+
+          win.update_frame(display_frame)
           app.processEvents()
-          input("\n[TERMINAL] Press [ENTER] to retry opening the device...")
-          continue
 
-      # --- Stage 2: Capture, Save, and Delayed Playback ---
-      try:
-        # Read frame and hardware timestamp
-        raw_mjpeg, v4l2_ts = cap.read_frame(timeout=2.0)
-        capture_time = time.time()
-        
-        # Save frame bytes and write timestamp to txt file
-        out_file.write(raw_mjpeg)
-        ts_file.write(f"{v4l2_ts:.6f}\n")
+          file_size_mb = out_file.tell() / (1024 * 1024)
+          sys.stdout.write(
+              f"\r[>] Target: {win.delay_sec:04.1f}s | Delay:"
+              f" {actual_delay:05.2f}s | Size: {file_size_mb:05.1f}MB [Keys:"
+              " +/-, b, f, q]   "
+          )
+          sys.stdout.flush()
 
-        np_arr = np.frombuffer(raw_mjpeg, dtype=np.uint8)
-        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        if frame_bgr is not None:
-          frame_buffer.append((capture_time, frame_bgr))
-
-        now = time.time()
-        target_time = now - win.delay_sec
-
-        while len(frame_buffer) > 1 and frame_buffer[1][0] <= target_time:
-          frame_buffer.popleft()
-
-        if frame_buffer:
-          display_frame = frame_buffer[0][1]
-          actual_delay = now - frame_buffer[0][0]
-        else:
-          display_frame = np.zeros((cap.actual_h, cap.actual_w, 3), dtype=np.uint8)
-          actual_delay = 0.0
-
-        win.update_frame(display_frame)
-        app.processEvents()
-        
-        file_size_mb = out_file.tell() / (1024 * 1024)
-
-        sys.stdout.write(
-            f"\r[>] Tgt: {win.delay_sec:04.1f}s | Real: {actual_delay:05.2f}s | "
-            f"Size: {file_size_mb:05.1f}MB [Keys: +/-, b, f, q]   "
-        )
-        sys.stdout.flush()
-
-      except (OSError, IOError, TimeoutError) as err:
-        print() 
-        if not os.path.exists(node_path):
-          print(f'\n[!] Camera disconnected! Polling Port {locked_devpath} for reconnection...')
-          if cap:
-            cap.stop()
-            cap = None
-          frame_buffer.clear()
-          end_time = time.time() + 0.7
-          while time.time() < end_time:
+        except (OSError, IOError, TimeoutError) as err:
+          print()
+          if not os.path.exists(node_path):
+            print(
+                f"\n[!] Device lost! Polling Port {locked_devpath} to"
+                " reconnect..."
+            )
+            if cap:
+              cap.stop()
+              cap = None
+            frame_buffer.clear()
+            end_time = time.time() + poll_interval
+            while time.time() < end_time:
               app.processEvents()
               time.sleep(0.05)
-        else:
-          print(f'\n[!] Stream Error: {err}')
-          if cap:
-            cap.stop()
-            cap = None
-          frame_buffer.clear()
-          app.processEvents()
-          input('\n[TERMINAL] Press [ENTER] to stop & restart stream...')
+          else:
+            print(f"\n[!] Ingestion error: {err}")
+            if cap:
+              cap.stop()
+              cap = None
+            frame_buffer.clear()
+            app.processEvents()
+            input("\n[TERMINAL] Press [ENTER] to reset and resume capture...")
 
-  finally:
-    if cap: cap.stop()
-    out_file.close()
-    ts_file.close()
-    print(f"\n\n[+] Recording safely saved in: '{save_dir}/'")
+    finally:
+      if cap:
+        cap.stop()
+      print(f"\n\n[+] Stream cleanly halted. Saved session: '{save_dir}/'")
+
 
 # ==============================================================================
 # Entry Point
 # ==============================================================================
-if __name__ == '__main__':
-  list_available_cameras()
-  user_input = input("Enter USB Bus and Device separated by a space (e.g., '1 5'): ").strip()
-  try:
-    bus_str, dev_str = user_input.split()
-    target_bus = int(bus_str)
-    target_dev = int(dev_str)
-  except ValueError:
-    print("Invalid format. Please enter two numbers separated by a space.")
-    sys.exit(1)
+if __name__ == "__main__":
+  config = load_or_create_config()
+  configured_bus = config.getint("camera", "bus", fallback=0)
+  configured_dev = config.getint("camera", "device", fallback=0)
 
-  run_stream(target_bus, target_dev, requested_width=1920, requested_height=1080)
+  if configured_bus == 0 and configured_dev == 0:
+    list_available_cameras()
+    user_input = input(
+        "Enter USB Bus and Device separated by a space (e.g., '1 5'): "
+    ).strip()
+    try:
+      b_str, d_str = user_input.split()
+      target_bus = int(b_str)
+      target_dev = int(d_str)
+    except ValueError:
+      print("Invalid format. Please supply two integers.")
+      sys.exit(1)
+  else:
+    target_bus = configured_bus
+    target_dev = configured_dev
+    print(f"[*] Targeting configured USB Bus: {target_bus}, Dev: {target_dev}")
+
+  run_stream(target_bus, target_dev, config)
