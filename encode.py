@@ -94,7 +94,7 @@ def main():
   preset = config.get("encoding", "preset", fallback="fast")
   pix_fmt = config.get("encoding", "pixel_format", fallback="yuv420p")
   out_name = config.get(
-      "encoding", "output_filename", fallback="output_synced.mp4"
+      "encoding", "output_filename", fallback="output.mp4"
   )
 
   mjpeg_file = os.path.join(target_dir, video_fn)

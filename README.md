@@ -4,7 +4,8 @@
 ### Purpose
 
 A high-precision, low-overhead Linux media capture, audio routing, and synchronization suite.
-Made for RLdragon or the Research and Theorize Mythology Club
+Made for RLdragon or the Research and Theorize Mythology Club.
+Made to stream/share screen to Vesktop, a discord wrapper.
 
 ---
 
@@ -25,8 +26,8 @@ Made for RLdragon or the Research and Theorize Mythology Club
 ├── config/
 │   ├── audio.config          # Audio routing & virtual sink settings
 │   └── video.config          # Camera, monitor & encoder settings
-├── audio_bridge.py           # PulseAudio/PipeWire router
-├── capture_monitor.py        # Real-time capture & delayed playback tool
+├── audio_stream.py           # PulseAudio/PipeWire router
+├── video_stream.py        # Real-time capture & delayed playback tool
 ├── encode.py                 # Precision V4L2 MJPEG VFR encoder
 └── recordings/               # Output directory for video sessions
     └── capture_YYYYMMDD_HHMMSS/
@@ -78,19 +79,19 @@ All settings can be customized in the respective configuration files:
 #### 1. Audio Routing
 
 ```bash
-python3 audio_bridge.py
+python3 audio_stream.py
 
 ```
 
 * **OBS Setup:** Set **Settings > Audio > Advanced > Monitoring Device** to `OBS_Input`.
-* **Target App (Discord/Vesktop):** Set **Input Device** to `Monitor of Audio_Stream_Output`.
+* **Vesktop Share Screen:** Set **Audio Sources** to the python script name. Default: `Audio_Bridge_Primary`.
 * **Monitor Selection:** Enter your headphone's numeric ID, or `none` to mirror the default sink.
 * **Exit:** `q` / `Ctrl+C` preserves `OBS_Input` (prevents OBS device resets); `qc` unloads all virtual sinks.
 
 #### 2. Video Capture & Delayed Monitor
 
 ```bash
-python3 capture_monitor.py
+python3 video_stream.py
 
 ```
 
@@ -111,4 +112,4 @@ python3 encode.py recordings/capture_YYYYMMDD_HHMMSS
 
 ```
 
-The output file will be generated at `recordings/capture_YYYYMMDD_HHMMSS/output_vfr.mp4`.
+The output file will be generated at `recordings/capture_YYYYMMDD_HHMMSS/output.mp4`.
